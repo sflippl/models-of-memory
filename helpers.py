@@ -72,6 +72,22 @@ def make_training_order(first_pairs, second_pairs, unrelated_pairs):
     return all_items
 
 
+def is_derangement(original_list, permuted_list):
+    """Checks if a permuted list is a derangement of the original list."""
+    for i in range(len(original_list)):
+        if original_list[i] == permuted_list[i]:
+            return False
+    return True
+def generate_derangement(input_list):
+    """Generates a random derangement of the input list."""
+    random.seed(0)
+    temp_list = list(input_list) # Create a copy to avoid modifying the original
+    while True:
+        random.shuffle(temp_list)
+        if is_derangement(input_list, temp_list):
+            return temp_list
+
+
 def make_inp(words, test_words=[], preamble='', cue='', interjection=None, interjection_words=[]):
     inp = f'{preamble} {", ".join(words)}. '
     if interjection:
