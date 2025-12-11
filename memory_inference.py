@@ -129,7 +129,7 @@ def generate_prompt(train_pairs, test_probe):
     prompt = ""
     for token1, token2 in train_pairs:
         prompt += f"{token1}->{token2} "
-    prompt += f"{test_probe}: "
+    prompt += f"{test_probe}->"
     return prompt
 
 
