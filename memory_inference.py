@@ -1,458 +1,349 @@
 """
-***Memory Inference Experiments***
+MEMORY INFERENCE EXPERIMENTS
+This implements something like a paired-associate inference experiment.
+Given A-R1-B and B-R2-C we test if the model can infer A-R1+R2-C.
 
-Train on associative inference task, assess integrative encoding (proactive) vs. retrieval-time inference (reactive)
+USAGE EXAMPLE:
+the main function is generate_trials(), which works as follows:
+Arguments:
+    - stim_type
+        OPTIONS: 'single_token_nouns', 'real_geography', 'wrong_geography', 'fake_geography', 'scifi_geography', 'properties', 'formal'
+        See below for explanation.
+    - n_trials (each trial is a unique prompt)
+    - tokenizer (only needed for single-token noun stimuli)
+    - fan_type ('in' or 'out')
+    - fan_degree (number of A's per B for 'in', number of B's per A for 'out')
+    - n_sets (number of A-B-C sets)
+    - add_ac_pairs (whether to add A-C pairs from other sets into the prompt)
+Returns:
+    list of dict, each dict is a "trial" with keys 'prompt', 
+    'target_c', 'distractor_c', 'target_b', 'distractor_b', 
+    'target_a', 'a_items', 'b_items', 'c_items'
 
-Paired associate inference setup: goal is to measure A-C association
-- Simplest version: AB BC -> A? -> measure output probability of B and C
-- Fan in & fan out versions (multiple As to one B, multiple Bs to one A)
+You can also use testing_helper(model, tokenizer) to run a bunch of trials and compute accuracy.
+But generate_trials() will work to make your own manual loop.
 
-Other task ideas (not implemented here):
-- Acquired equivalence: AB CB AD -> C?
-- Other task: AB CB XY -> A? AB AC XY -> B?
+STIMULUS TYPES:
+    - "single_token_nouns": chair->trumpet trumpet->cheese chair->
+    - "real_geography": Sam is from Paris. Paris is in France. Sam is from the country of
+    - "wrong_geography": Sam is from Paris. Paris is in Germany. Sam is from the country of
+    - "fake_geography": Sam is from Fubalu. Fubalu is in France. Sam is from the country of
+    - "scifi_geography": Sam is from Arakeen. Arakeen is in France. Sam is from the country of
+    - "properties": Fubalu is made from glarp. Glarp has the property of translucense. Fubalu has the property of 
+    - "formal": A1 R1 B1  B1 R2 C1  A1 R1+R2 C1
 
+If you'd like to manually edit the stimuli or relations, you can do so in the "stimulus generator" functions.
 """
 
-import sys, random, uuid, os
-import pandas as pd
+import random
+import string
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from collections import defaultdict
-from tqdm import tqdm
-import torch
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 import nltk
-nltk.download('wordnet')
-nltk.download('names')
-nltk.download('gazetteers')
-from nltk.corpus import wordnet, names, gazetteers
+from nltk.corpus import wordnet
+from typing import List, Tuple, Dict, Any, Optional
+import torch
+import pandas as pd
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+def setup_nltk():
+    try:
+        wordnet.all_synsets('n')
+    except LookupError:
+        nltk.download('wordnet')
+setup_nltk()
+from stimuli import NAMES, CITY_COUNTRY_PAIRS, SCIFI_LOCATIONS, PROPERTIES
 
-# for running on colab
-if 'google.colab' in sys.modules:
-    os.system("git clone https://github.com/sflippl/models-of-memory.git")
-    sys.path.append('models-of-memory')
-    dir = 'models-of-memory'
-else:
-    print("Running locally")
-    dir = '.'
 
+# --- Stimulus Generator Helpers (Pools) ---
 
-def generate_stimuli(all_tokens, n_sets, n_distractor_pairs, fan_in_pct, fan_out_pct, fan_in_degree, fan_out_degree, 
-                     stimulus_type='words', stimulus_dict=None):
-    """
-    Each "set" is A->B->C, but strictly its the number of C items (because of fan in/fan out)
-    Distractor XY pairs are randomly intermixed if requested
-    Fan structure:
-        - fan_in_pct: proportion of sets with fan-in structure (multiple As -> one B -> one C)
-        - fan_out_pct: proportion of sets with fan-out structure (one A -> multiple Bs -> one C)
-        - fan_in_degree: how many A tokens lead to the same B (e.g., 3 means A1->B, A2->B, A3->B->C)
-        - fan_out_degree: how many B tokens each A leads to (e.g., 5 means A->B1, A->B2, ..., A->B5, then A->C)
-    stimulus_type: 'words', 'names', or 'fakenames'
-    stimulus_dict: optional dict with 'A' list and 'BC_pairs' list of tuples for cities/countries mode
-    Returns: 
-        - list of tuples of training pairs
-        - list of possible probes (A)
-        - list of lists of direct targets B (may be more than one for fan out)
-        - list of indirect targets C (only one per A)
-        - list of fan types (simple, fan_in, fan_out)
-    """
-    if fan_in_pct + fan_out_pct > 1:
-        raise ValueError("fan_in_pct + fan_out_pct cannot exceed 1.0")
-    
-    # determine how many sets of each type
-    n_sets_fan_in = int(n_sets * fan_in_pct)
-    n_sets_fan_out = int(n_sets * fan_out_pct)
-    n_sets_simple = n_sets - n_sets_fan_in - n_sets_fan_out
-
-    # calculate and generate tokens
-    n_a_tokens = n_sets_simple + (n_sets_fan_in * fan_in_degree) + n_sets_fan_out
-    n_b_tokens = n_sets_simple + n_sets_fan_in + (n_sets_fan_out * fan_out_degree)
-    n_c_tokens = n_sets  # one C per set
-    n_x_tokens = n_y_tokens = n_distractor_pairs
-
-    if stimulus_dict: 
-        a_tokens = np.random.choice(stimulus_dict['A'], n_a_tokens, replace=False)
-        # Select matching BC pairs
-        bc_indices = np.random.choice(len(stimulus_dict['BC_pairs']), n_sets, replace=False)
-        selected_bc = [stimulus_dict['BC_pairs'][i] for i in bc_indices]
-        b_tokens = [bc[0] for bc in selected_bc]
-        c_tokens = [bc[1] for bc in selected_bc]
-        x_tokens = np.random.choice(all_tokens, n_x_tokens, replace=False) 
-        y_tokens = np.random.choice(all_tokens, n_y_tokens, replace=False)
-    else:
-        n_total_tokens = int(n_a_tokens + n_b_tokens + n_c_tokens + n_x_tokens + n_y_tokens)
-        tokens = np.random.choice(all_tokens, n_total_tokens, replace=False)
-        split_indices = np.cumsum([n_a_tokens, n_b_tokens, n_c_tokens, n_x_tokens, n_y_tokens], dtype=int)[:-1]
-        a_tokens, b_tokens, c_tokens, x_tokens, y_tokens = np.split(tokens, split_indices)
-
-    # build pairs and track mappings
-    ab_pairs, bc_pairs, xy_pairs = [],[],[]
-    direct_targets = []  # list of lists: each entry corresponds to each A, containing a list of its Bs 
-    indirect_targets = []  # list: each entry corresponds to each A, containing its C
-    pair_types = [] # track whether each pair is AB, BC, or XY
-    fan_types = []  # track whether each A is simple, fan_in, or fan_out
-    a_idx, b_idx, c_idx = 0, 0, 0 # keep track of where we are in the tokens
-
-    # simple sets: 1 A -> 1 B -> 1 C
-    for _ in range(n_sets_simple):
-        ab_pairs.append((a_tokens[a_idx], b_tokens[b_idx]))
-        bc_pairs.append((b_tokens[b_idx], c_tokens[c_idx]))
-        direct_targets.append([b_tokens[b_idx]])
-        indirect_targets.append(c_tokens[c_idx])
-        fan_types.append('simple')
-        a_idx += 1
-        b_idx += 1
-        c_idx += 1
-    
-    # Fan-in sets: multiple As -> 1 B -> 1 C
-    for _ in range(n_sets_fan_in): 
-        for _ in range(fan_in_degree): # A1->B, A2->B, ...
-            ab_pairs.append((a_tokens[a_idx], b_tokens[b_idx]))
-            direct_targets.append([b_tokens[b_idx]])
-            indirect_targets.append(c_tokens[c_idx])
-            fan_types.append('fan_in')
-            a_idx += 1
-        bc_pairs.append((b_tokens[b_idx], c_tokens[c_idx])) # only one BC pair per set
-        b_idx += 1
-        c_idx += 1
-    
-    # Fan-out sets: 1 A -> multiple Bs; only first B -> C
-    for _ in range(n_sets_fan_out):
-        b_list = []
-        for i in range(fan_out_degree): # A->B1, A->B2, ...
-            ab_pairs.append((a_tokens[a_idx], b_tokens[b_idx]))
-            b_list.append(b_tokens[b_idx])
-            if i == 0:  # Only pair the first B with C
-                bc_pairs.append((b_tokens[b_idx], c_tokens[c_idx]))
-            b_idx += 1
-        direct_targets.append(b_list)
-        indirect_targets.append(c_tokens[c_idx])
-        fan_types.append('fan_out')
-        a_idx += 1
-        c_idx += 1
-
-    xy_pairs = list(zip(x_tokens, y_tokens))
-    
-    # Shuffle BC pairs
-    bc_perm = np.random.permutation(len(bc_pairs))
-    bc_shuffled = [bc_pairs[i] for i in bc_perm]
-    
-    # Combine training pairs and track types
-    train_pairs = ab_pairs + bc_shuffled
-    pair_types = ['AB'] * len(ab_pairs) + ['BC'] * len(bc_pairs)
-    
-    # Insert XY pairs at random locations
-    for xy_pair in xy_pairs:
-        idx = np.random.randint(0, len(train_pairs) + 1)
-        train_pairs.insert(idx, xy_pair)
-        pair_types.insert(idx, 'XY')
-
-    return train_pairs, pair_types, fan_types, a_tokens, direct_targets, indirect_targets
-    
-
-def generate_prompt(train_pairs, pair_types, test_probe, correct_target=None, foil=None, stimulus_type='words', prompt_type='standard'):
-    prompt = ""
-    # training pairs
-    if stimulus_type == 'words':
-        for p in train_pairs:
-            prompt += f"{p[0]}->{p[1]} "
-    else:
-        for p, p_type in zip(train_pairs, pair_types):
-            if p_type == 'AB' or ():
-                prompt += f"{p[0]} is from {p[1]}. "
-            elif p_type == 'BC':
-                prompt += f"{p[0]} is in {p[1]}. "
-            elif random.random() < 0.5: # XY
-                prompt += f"{p[0]} is from {p[1]}. "
+def get_fake_words(n, length=5, seed=None):
+    """Pronounceable fake words alternating consonants and vowels"""
+    if seed is not None:
+        random.seed(seed)
+    vowels = "aeiou"
+    consonants = "".join(set(string.ascii_lowercase) - set(vowels))
+    words = []
+    while len(words) < n:
+        word = ""
+        for i in range(length):
+            if i % 2 == 0:
+                word += random.choice(consonants)
             else:
-                prompt += f"{p[0]} is in {p[1]}. "
+                word += random.choice(vowels)
+        if word not in words:
+            words.append(word.capitalize())
+    return words
 
-    # Query structure
-    if prompt_type == 'standard':
-        if stimulus_type == 'words':
-            prompt += f"{test_probe}->"
-        else:
-            prompt += f"{test_probe} is from "
-    elif prompt_type == 'AFC':
-        choices = [correct_target, foil]
-        random.shuffle(choices)
-        if stimulus_type == 'words':
-            prompt += f"{test_probe}->{choices[0]} or {choices[1]}? "
-        else:
-            prompt += f"Is {test_probe} from {choices[0]} or {choices[1]}? "
-    return prompt
+def get_single_token_nouns(tokenizer, n):
+    """Single token nouns from wordnet in a given tokenizer"""
+    nouns = list(set([lemma.name() for syn in wordnet.all_synsets("n") for lemma in syn.lemmas() if lemma.name().isalpha()]))
+    if tokenizer:
+        single_tokens = [n for n in nouns if len(tokenizer.encode(n, add_special_tokens=False)) == 1]
+    else:
+        single_tokens = [n for n in nouns if len(n) < 6]
+    return random.sample(single_tokens, n)
+
+def get_names(n):
+    """Names from stimuli module"""
+    return random.sample(NAMES, n)
+
+def get_scifi_cities(n):
+    """Sci-Fi locations from stimuli module"""
+    return random.sample(SCIFI_LOCATIONS, n)
+
+def get_cities_countries(n, swap_pairs=False):
+    """Verified City-Country pairs from stimuli module"""
+    selected_pairs = random.sample(CITY_COUNTRY_PAIRS, n)
+    cities = [p[0] for p in selected_pairs]
+    countries = [p[1] for p in selected_pairs]
+    if swap_pairs:
+        # Guarantee no city matches its country
+        shuffled_countries = countries[:]
+        if len(countries) > 1:
+            while any(shuffled_countries[i] == countries[i] for i in range(len(countries))):
+                random.shuffle(shuffled_countries)
+        countries = shuffled_countries
+    return cities, countries
+
+
+# --- Stimulus Generators (return A, B, C, relations) ---
+
+def get_noun_stimuli(tokenizer, n):
+    # Need 3n unique nouns total for A, B, C
+    pool = get_single_token_nouns(tokenizer, 3*n)
+    return pool[:n], pool[n:2*n], pool[2*n:3*n], [" -> ", " -> ", " -> "]
+
+def get_real_geography_stimuli(n):
+    a = get_names(n)
+    b, c = get_cities_countries(n, swap_pairs=False)
+    return a, b, c, [" is from ", " is in ", " is from the country of "]
+
+def get_wrong_geography_stimuli(n):
+    a = get_names(n)
+    b, c = get_cities_countries(n, swap_pairs=True)
+    return a, b, c, [" is from ", " is in ", " is from the country of "]
+
+def get_fake_geography_stimuli(n):
+    a = get_names(n)
+    b = get_fake_words(n, length=6)
+    _, c = get_cities_countries(n)
+    return a, b, c, [" is from ", " is in ", " is from the country of "]
+
+def get_scifi_geography_stimuli(n):
+    a = get_names(n)
+    b = get_scifi_cities(n)
+    _, c = get_cities_countries(n) # Random real countries
+    return a, b, c, [" is from ", " is in ", " is from the country of "]
+
+def get_object_property_stimuli(n):
+    # Need 2n fake words for objects and materials
+    words = get_fake_words(2*n, length=6)
+    objs = words[:n]
+    mats = words[n:]
+    prop_list = random.sample(PROPERTIES, n)
+    return objs, mats, prop_list, [" is made of ", " has the property of ", " has the property of "]
+
+def get_formal_stimuli(n, offset=0):
+    a_items = [f"A{i+offset}" for i in range(1, n + 1)]
+    b_items = [f"B{i+offset}" for i in range(1, n + 1)]
+    c_items = [f"C{i+offset}" for i in range(1, n + 1)]
+    relations = [" R1 ", " R2 ", " (R1+R2) "]
+    return a_items, b_items, c_items, relations
+
+
+# --- Prompt Assembly Logic ---
+
+def assemble_inference_prompt(a_items, b_items, c_items, relations, 
+    fan_type='none', fan_degree=1, add_ac_pairs=False, n_sets=1):
+
+    r1, r2, r1r2 = relations
+    ab_pairs = []
+    bc_pairs = []
+    ac_map = {}
+    ab_map = {}
+    
+    if fan_type == 'in':
+        # Many A's to one B. B -> C is 1:1.
+        for i in range(n_sets):
+            b = b_items[i]
+            c = c_items[i]
+            bc_pairs.append((b, c))
+            for j in range(fan_degree):
+                idx = i * fan_degree + j
+                if idx < len(a_items):
+                    a = a_items[idx]
+                    ab_pairs.append((a, b))
+                    ac_map[a] = c
+                    ab_map[a] = b
+                
+    elif fan_type == 'out':
+        # One A to many B's. Each B -> C is 1:1.
+        for i in range(n_sets):
+            if i < len(a_items) and i < len(c_items):
+                a = a_items[i]
+                c = c_items[i]
+                current_cities = []
+                for j in range(fan_degree):
+                    idx = i * fan_degree + j
+                    if idx < len(b_items):
+                        b = b_items[idx]
+                        ab_pairs.append((a, b))
+                        bc_pairs.append((b, c))
+                        current_cities.append(b)
+                ac_map[a] = c
+                ab_map[a] = current_cities
+            
+    else: # none
+        for i in range(n_sets):
+            if i < len(a_items) and i < len(b_items) and i < len(c_items):
+                a, b, c = a_items[i], b_items[i], c_items[i]
+                ab_pairs.append((a, b))
+                bc_pairs.append((b, c))
+                ac_map[a] = c
+                ab_map[a] = b
+
+    random.shuffle(ab_pairs)
+    random.shuffle(bc_pairs)
+    
+    # Target Selection (use first a_item as target)
+    target_a = a_items[0]
+    target_c = ac_map.get(target_a, "")
+    target_b = "" if fan_type == 'out' else ab_map.get(target_a, "")
+    
+    # Distractor Selection (only if n_sets == 2)
+    distractor_c = [c for c in c_items if c != target_c][0] if n_sets == 2 else ""
+    # Find a city associated with the distractor country
+    distractor_b = [b for b, c in bc_pairs if c == distractor_c][0] if n_sets == 2 and distractor_c else ""
+    
+    sentences = []
+    for a, b in ab_pairs:
+        sentences.append(f"{a}{r1}{b}.")
+    for b, c in bc_pairs:
+        sentences.append(f"{b}{r2}{c}.")
+        
+    if add_ac_pairs:
+        for a, c in ac_map.items():
+            if a != target_a:
+                sentences.append(f"{a}{r1r2}{c}.")
+    
+    prompt_body = " ".join(sentences)
+    prompt = f"{prompt_body} Therefore, {target_a}{r1r2}"
+    
+    return {
+        "prompt": prompt,
+        "target": target_c,
+        "target_c": target_c,
+        "distractor_c": distractor_c,
+        "target_b": target_b,
+        "distractor_b": distractor_b,
+        "target_a": target_a,
+        "a_items": a_items,
+        "b_items": b_items,
+        "c_items": c_items
+    }
+
+def get_stimuli_by_type(stim_type, n, tokenizer=None, seed=None, offset=0):
+    if seed is not None: random.seed(seed)
+    if stim_type == "formal":
+        return get_formal_stimuli(n, offset=offset)
+    elif stim_type == "single_token_nouns":
+        return get_noun_stimuli(tokenizer, n)
+    elif stim_type == "real_geography":
+        return get_real_geography_stimuli(n)
+    elif stim_type == "wrong_geography":
+        return get_wrong_geography_stimuli(n)
+    elif stim_type == "scifi_geography":
+        return get_scifi_geography_stimuli(n)
+    elif stim_type == "fake_geography":
+        return get_fake_geography_stimuli(n)
+    elif stim_type == "properties":
+        return get_object_property_stimuli(n)
+    else:
+        raise ValueError(f"Unknown stim_type: {stim_type}")
+
+
+def generate_trials(stim_type, n_trials=100, tokenizer=None, 
+    fan_type='none', fan_degree=1, n_sets=2, add_ac_pairs=False):
+
+    trials = []
+    for i in range(n_trials):
+        n_needed = max(n_sets * fan_degree, n_sets)
+        a, b, c, rels = get_stimuli_by_type(stim_type, n_needed, tokenizer, seed=i, offset=i*n_needed)
+        trial = assemble_inference_prompt(
+            a, b, c, rels,
+            fan_type=fan_type,
+            fan_degree=fan_degree,
+            add_ac_pairs=add_ac_pairs,
+            n_sets=n_sets
+        )
+        trials.append(trial)
+    return trials
 
 
 def load_model(model_id):
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map="auto")
+    """Load model and tokenizer with bfloat16"""
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     return model, tokenizer
 
+# helpers for assessing correctness
+def x_before_y(text: str, x: str, y: str) -> bool:
+    """Check if string x appears before y in text"""
+    x_pos = text.find(x)
+    y_pos = text.find(y)
+    if x_pos == -1: return False
+    if y_pos == -1: return True
+    return x_pos < y_pos
 
-def get_single_tokens(tokenizer, arr):
-  return [a for a in arr if len( tokenizer(a, add_special_tokens=False)["input_ids"] ) == 1 ]
-
-def get_single_token_nouns(tokenizer):
-    """get list of nouns from wordnet that are single tokens in the given model"""
-    nouns = [lemma.name() for syn in wordnet.all_synsets("n") for lemma in syn.lemmas()]
-    nouns = [n for n in nouns if n.isalpha()]
-    return get_single_tokens(tokenizer, nouns)
-
-def get_single_token_names(tokenizer):
-    """get list of names from nltk names corpus that are single tokens"""
-    all_names = names.words('male.txt') + names.words('female.txt')
-    return list(set(get_single_tokens(tokenizer, all_names)))
-
-def get_single_token_geography(tokenizer):
-    pairs = [
-        ("Paris", "France"), ("Berlin", "Germany"), ("Rome", "Italy"), ("Madrid", "Spain"), ("Lisbon", "Portugal"),
-        ("Vienna", "Austria"), ("Brussels", "Belgium"), ("Athens", "Greece"), ("Warsaw", "Poland"), ("Prague", "Czechia"),
-        ("Tokyo", "Japan"), ("Seoul", "Korea"), ("Beijing", "China"), ("Bangkok", "Thailand"), ("Hanoi", "Vietnam"),
-        ("Delhi", "India"), ("Manila", "Philippines"), ("Jakarta", "Indonesia"), ("Cairo", "Egypt"), ("Nairobi", "Kenya"),
-        ("Lagos", "Nigeria"), ("Accra", "Ghana"), ("Tunis", "Tunisia"), ("Algiers", "Algeria"), ("Moscow", "Russia"),
-        ("Kyiv", "Ukraine"), ("Oslo", "Norway"), ("Stockholm", "Sweden"), ("Helsinki", "Finland"), ("Copenhagen", "Denmark"),
-        ("Dublin", "Ireland"), ("London", "UK"), ("Ottawa", "Canada"), ("Mexico", "Mexico"), ("Havana", "Cuba"),
-        ("Kingston", "Jamaica"), ("Panama", "Panama"), ("Bogota", "Colombia"), ("Quito", "Ecuador"), ("Lima", "Peru"),
-        ("Santiago", "Chile"), ("Brasilia", "Brazil"), ("Caracas", "Venezuela"), ("Sydney", "Australia"), ("Suva", "Fiji"),
-        ("Amman", "Jordan"), ("Beirut", "Lebanon"), ("Baghdad", "Iraq"), ("Tehran", "Iran"), ("Riyadh", "Saudi"),
-        ("Kuwait", "Kuwait"), ("Doha", "Qatar"), ("Muscat", "Oman"), ("Kabul", "Afghanistan"), ("Islamabad", "Pakistan")
-    ]
-    single_token_pairs = []
-    for city, country in pairs:
-        country_ids = tokenizer(country, add_special_tokens=False)["input_ids"] # this is the only one that needs to be single-token
-        if len(country_ids) == 1:
-            single_token_pairs.append((city, country))
-    return single_token_pairs
+def correct_helper(df):
+    """Decide if output is correct: is target token first, or does it come before distractor/direct"""
+    target_first = np.array([
+        outp.split()[0].translate(str.maketrans('', '', string.punctuation)) == target_c 
+        for outp, target_c in zip(df['outp'], df['target_c'])
+    ])
+    target_before_distractor = np.array([
+        x_before_y(outp, target_c, distractor_c) 
+        for outp, target_c, distractor_c in zip(df['outp'], df['target_c'], df['distractor_c'])
+    ])
+    target_before_direct = np.array([
+        x_before_y(outp, target_c, target_b) 
+        for outp, target_c, target_b in zip(df['outp'], df['target_c'], df['target_b'])
+    ])
+    df['correct'] = target_first | target_before_distractor
+    df['direct'] = target_first | target_before_direct
+    return df
 
 
-def get_fictional_single_tokens(tokenizer, count):
-    """
-    Scavenges the model's own vocabulary for strings it treats as atomic 
-    but that are not recognized as real English nouns.
-    """
-    # Get all potential strings from the model's vocabulary
-    # (Handling various tokenizer formats like GPT, Llama, and BERT)
-    vocab = tokenizer.get_vocab().keys()
-    fictional_pool = []
-    
-    for t in vocab:
-        # 1. Clean up subword/whitespace markers (like 'Ġ', ' ', '##')
-        clean = t.replace('Ġ', '').replace(' ', '').replace('##', '')
+### run some trials
+def testing_helper(model, tokenizer, stim_type="scifi", n_trials=100, **kwargs):
+    """Run model inference on a set of trials and return evaluation results"""
+    dct = {
+        'outp': [],
+        'target_c': [],
+        'distractor_c': [],
+        'target_b': [],
+        'distractor_b': []
+    }
+    for _ in tqdm(range(n_trials)):
+        trial = generate_trials(stim_type, n_trials=1, tokenizer=tokenizer, **kwargs)[0]
+        inputs = tokenizer.encode(trial['prompt'], return_tensors='pt').to(model.device)
+        outp_ids = model.generate(inputs, max_new_tokens=10)
+        outp = tokenizer.batch_decode(outp_ids[:, inputs.shape[-1]:], skip_special_tokens=True)
         
-        # 2. Heuristics for a "Country" name (alphabetic, 5-8 chars)
-        if clean.isalpha() and 5 <= len(clean) <= 8:
-            # 3. Validation: Verify it stays a single token and isn't a real word
-            if len(tokenizer.encode(clean, add_special_tokens=False)) == 1:
-                if not wordnet.synsets(clean.lower()):
-                    fictional_pool.append(clean.capitalize())
+        dct['outp'].append(outp)
+        dct['target_c'].append(trial['target_c'])
+        dct['distractor_c'].append(trial['distractor_c'])
+        dct['target_b'].append(trial['target_b'])
+        dct['distractor_b'].append(trial['distractor_b'])
         
-        if len(fictional_pool) >= count + 50: # Get a buffer then stop
-            break
-            
-    return random.sample(fictional_pool, min(count, len(fictional_pool)))
+    df = pd.DataFrame(dct)
+    df['outp'] = [x[0] for x in df['outp']]
+    return correct_helper(df)
 
 
-def query_model(model, tokenizer, prompt, target_tokens=None):
-    """
-    Get logits, probabilities, and ranks for specific target tokens.
-    If target_tokens is None, returns top 10 ranked tokens.
-    Returns dict mapping each target token to {logit, prob, rank}
-    """
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-        next_token_logits = outputs.logits[0, -1, :]  # logits for next token
-    probs = torch.softmax(next_token_logits, dim=-1)  # probabilites for next token
-    
-    if target_tokens is None:
-        top_probs, top_indices = torch.topk(probs, 10)
-        results = {}
-        for i in range(10):
-            token_id = top_indices[i].item()
-            token = tokenizer.decode([token_id])
-            results[token] = {
-                'logit': next_token_logits[token_id].item(), 
-                'prob': top_probs[i].item(), 
-                'rank': i + 1
-            }
-        return results
-
-    target_token_ids = [tokenizer.encode(t, add_special_tokens=False)[0] for t in target_tokens]
-    results = {}
-    for token, token_id in zip(target_tokens, target_token_ids):
-        results[token] = {
-            'logit': next_token_logits[token_id].item(), 
-            'prob': probs[token_id].item(), 
-            'rank': (probs > probs[token_id]).sum().item() + 1
-        }
-    return results
-
-
-
-def plot_results(results_df, savepath=None):
-    
-    fan_types = results_df['fan_type'].unique()
-    n_rows = len(fan_types)
-    
-    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 4*n_rows), dpi=200)
-    if n_rows == 1:
-        axes = axes.reshape(1, -1)
-    plt.subplots_adjust(wspace=0.3, hspace=0.4)
-    
-    color_b = 'royalblue'  # blue for direct
-    color_c = 'forestgreen'  # green for indirect
-    
-    for row, fan_type in enumerate(fan_types):
-        # Direct targets (B) - left column
-        ax_b = axes[row, 0]
-        ax_b_rank = ax_b.twinx()
-        
-        b_data = results_df[(results_df['fan_type'] == fan_type) & (results_df['target_type'] == 'direct')]
-        probs_b = b_data['probability'].values
-        ranks_b = b_data['rank'].values
-        
-        # Violin plots
-        parts_prob = ax_b.violinplot([probs_b], positions=[0.3], widths=0.25, showmeans=True)
-        for pc in parts_prob['bodies']:
-            pc.set_facecolor(color_b)
-            pc.set_alpha(0.5)
-        parts_rank = ax_b_rank.violinplot([ranks_b], positions=[0.7], widths=0.25, showmeans=True)
-        for pc in parts_rank['bodies']:
-            pc.set_facecolor(color_b)
-            pc.set_alpha(0.5)
-        
-        # Scatter points
-        ax_b.scatter(np.zeros(len(probs_b)) + 0.3 + np.random.normal(0, 0.02, len(probs_b)), 
-                     probs_b, alpha=0.4, s=15, color=color_b)
-        ax_b_rank.scatter(np.zeros(len(ranks_b)) + 0.7 + np.random.normal(0, 0.02, len(ranks_b)), 
-                          ranks_b, alpha=0.4, s=15, color=color_b)
-        
-        ax_b.set_ylabel('Probability', fontsize=11, fontweight='bold')
-        ax_b_rank.set_ylabel('Rank', fontsize=11, fontweight='bold')
-        ax_b.set_xticks([])
-        ax_b.set_title(f'{fan_type.replace("_", " ").title()} - Direct Targets (B)', fontsize=12, fontweight='bold')
-        ax_b.grid(axis='y', alpha=0.2)
-        
-        # Indirect targets (C) - right column
-        ax_c = axes[row, 1]
-        ax_c_rank = ax_c.twinx()
-        
-        c_data = results_df[(results_df['fan_type'] == fan_type) & (results_df['target_type'] == 'indirect')]
-        probs_c = c_data['probability'].values
-        ranks_c = c_data['rank'].values
-        
-        # Violin plots
-        parts_prob = ax_c.violinplot([probs_c], positions=[0.3], widths=0.25, showmeans=True)
-        for pc in parts_prob['bodies']:
-            pc.set_facecolor(color_c)
-            pc.set_alpha(0.5)
-        parts_rank = ax_c_rank.violinplot([ranks_c], positions=[0.7], widths=0.25, showmeans=True)
-        for pc in parts_rank['bodies']:
-            pc.set_facecolor(color_c)
-            pc.set_alpha(0.5)
-        
-        # Scatter points
-        ax_c.scatter(np.zeros(len(probs_c)) + 0.3 + np.random.normal(0, 0.02, len(probs_c)), 
-                     probs_c, alpha=0.4, s=15, color=color_c)
-        ax_c_rank.scatter(np.zeros(len(ranks_c)) + 0.7 + np.random.normal(0, 0.02, len(ranks_c)), 
-                          ranks_c, alpha=0.4, s=15, color=color_c)
-        
-        ax_c.set_ylabel('Probability', fontsize=11, fontweight='bold')
-        ax_c_rank.set_ylabel('Rank', fontsize=11, fontweight='bold')
-        ax_c.set_xticks([])
-        ax_c.set_title(f'{fan_type.replace("_", " ").title()} - Indirect Targets (C)', fontsize=12, fontweight='bold')
-        ax_c.grid(axis='y', alpha=0.2)
-    
-    plt.suptitle('Associative Inference: Next Token Predictions', fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    if savepath:
-        plt.savefig(savepath, bbox_inches='tight')
-    plt.show()
-
-
-def run_experiment(n_sets, model_id, n_distractor_pairs, fan_in_pct, fan_out_pct, fan_in_degree, fan_out_degree, stimulus_type='words', prompt_type='standard'):    
-    model, tokenizer = load_model(model_id)
-    
-    if stimulus_type == 'words':
-        all_tokens = get_single_token_nouns(tokenizer)
-    elif stimulus_type == 'names':
-        names = get_single_token_names(tokenizer)
-        geo_pairs = get_single_token_geography(tokenizer)
-        
-    elif stimulus_type == 'geography':
-        all_tokens = get_single_token_geography(tokenizer)
-    
-    stimulus_dict = None
-    if 'names' in stimulus_type:
-        names_list = get_single_token_names(tokenizer)
-        if 'fake' in stimulus_type:
-            # For fictional, we still generate them separately but we can pair them
-            cities_list = get_fictional_tokens(tokenizer, 50) 
-            countries_list = get_fictional_tokens(tokenizer, 50)
-            bc_pairs = list(zip(cities_list, countries_list))
-        else:
-            bc_pairs = get_single_token_geographic_pairs(tokenizer)
-        
-        stimulus_dict = {
-            'A': names_list,
-            'BC_pairs': bc_pairs
-        }
-
-    training_data = generate_stimuli(
-        all_tokens, n_sets, n_distractor_pairs, fan_in_pct, fan_out_pct, fan_in_degree, fan_out_degree,
-        stimulus_type=stimulus_type, stimulus_dict=stimulus_dict
-    )
-    train_pairs, pair_types, fan_types, test_probes, test_direct_targets, test_indirect_targets = training_data
-
-    results_list = []
-    for i, (probe, direct_targets, indirect_target, fan_type) in enumerate(zip(test_probes, test_direct_targets, test_indirect_targets, fan_types)):
-        # Pick foil for AFC
-        foil = None
-        if prompt_type == 'AFC':
-            # Pick a target from a DIFFERENT set
-            other_targets = [t for j, t in enumerate(test_indirect_targets) if j != i and t != indirect_target]
-            foil = random.choice(other_targets) if other_targets else "Unknown"
-
-        prompt = generate_prompt(train_pairs, pair_types, probe, correct_target=indirect_target, foil=foil, 
-                                 stimulus_type=stimulus_type, prompt_type=prompt_type)
-        
-        # Targets for probability check
-        all_targets = direct_targets + [indirect_target]
-        if foil and foil not in all_targets:
-            all_targets.append(foil)
-            
-        results = query_model(model, tokenizer, prompt, all_targets)
-        
-        # Log B results
-        for b in direct_targets:
-            results_list.append({
-                'fan_type': fan_type, 'target_type': 'direct', 'rank': results[b]['rank'],
-                'logit': results[b]['logit'], 'probability': results[b]['prob']
-            })
-        
-        # Log C results
-        results_list.append({
-            'fan_type': fan_type, 'target_type': 'indirect', 'rank': results[indirect_target]['rank'],
-            'logit': results[indirect_target]['logit'], 'probability': results[indirect_target]['prob'],
-            'foil_prob': results[foil]['prob'] if foil else None
-        })
-    
-    results = pd.DataFrame(results_list)
-    plot_results(results, savepath=f'{dir}/_figures/inference_{model_id.replace("/", "-")}_nsets-{n_sets}_ndistractorpairs-{n_distractor_pairs}_faninpct-{fan_in_pct}_fanoutpct-{fan_out_pct}_fanindegree-{fan_in_degree}_fanoutdegree-{fan_out_degree}_stim-{stimulus_type}_prompt-{prompt_type}.png')
-    return results
-
-
-if __name__ == '__main__':
-    n_sets = 10 # how many C items (BC pairs)
-    n_distractor_pairs = 0 # how many XY pairs
-    fan_in_pct = 0.0 # percentage of sets that fan in
-    fan_out_pct = 0.0 # percentage of sets that fan out
-    fan_in_degree = 2 # how many As per B
-    fan_out_degree = 2 # how many Bs per A
-    model_id = "Qwen/Qwen3-4B"
-    run_experiment(
-        n_sets, model_id, n_distractor_pairs, 
-        fan_in_pct, fan_out_pct, fan_in_degree, fan_out_degree, 
-        stimulus_type='abstract'
-    )
+if __name__ == "__main__":
+    # Example usage:
+    # model, tokenizer = load_model('Qwen/Qwen2.5-0.5B')
+    # results = testing_helper(model, tokenizer, stim_type="scifi", n_sets=2, fan_type='in', fan_degree=2)
+    # print(results.correct.mean())
+    pass
